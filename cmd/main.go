@@ -6,13 +6,12 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
-	"github.com/joho/godotenv"
 
+	"govacuum-engine-gc/internal/config"
 	"govacuum-engine-gc/internal/db"
 	"govacuum-engine-gc/internal/logic"
 	"govacuum-engine-gc/internal/mqtt"
@@ -58,46 +57,19 @@ type vacuumData struct {
 }
 
 func main() {
-	_ = godotenv.Load(".env.local", ".env") // best-effort, falls back to real env
+	cfg := config.Load()
 
-	dbCfg := db.Config{
-		URL:            requireEnv("SUPABASE_URL"),
-		ServiceRoleKey: requireEnv("SUPABASE_SERVICE_ROLE_KEY"),
-		Schema:         getEnv("SUPABASE_SCHEMA", "analytics"),
-	}
-
-	historyLimit, _ := strconv.Atoi(getEnv("IQR_HISTORY_LIMIT", "1000"))
-
-	emqxCfg := mqtt.EMQXConfig{
-		Broker:         requireEnv("EMQX_HOST"),
-		Port:           getEnv("EMQX_PORT", "8883"),
-		Username:       os.Getenv("EMQX_USERNAME"),
-		Password:       os.Getenv("EMQX_PASSWORD"),
-		UseTLS:         mustParseBool(getEnv("EMQX_TLS_ON", "true")),
-		CACert:         os.Getenv("EMQX_CA_CERTIFICATE"),
-		ClientIDPrefix: getEnv("EMQX_CLIENT_ID_PREFIX", "vacuum-engine_"),
-		RequestTopic:   requireEnv("MQTT_INSERT_REQUEST_TOPIC"), // must match gopub-edge's setting exactly
-	}
-
-	mosquittoCfg := mqtt.MosquittoConfig{
-		Broker:         requireEnv("MOSQUITTO_HOST"),
-		Port:           getEnv("MOSQUITTO_PORT", "1883"),
-		UseTLS:         mustParseBool(getEnv("MOSQUITTO_TLS_ON", "false")),
-		CACert:         os.Getenv("MOSQUITTO_CA_CERTIFICATE"),
-		ClientIDPrefix: getEnv("MOSQUITTO_CLIENT_ID_PREFIX", "vacuum-engine-reply_"),
-	}
-
-	replyClient, err := mqtt.ConnectReplyPublisher(mosquittoCfg)
+	replyClient, err := mqtt.ConnectReplyPublisher(cfg.Mosquitto)
 	if err != nil {
 		log.Fatalf("failed to connect to Mosquitto: %v", err)
 	}
 	defer replyClient.Disconnect(250)
 
 	handler := func(_ paho.Client, msg paho.Message) {
-		handleRequest(context.Background(), replyClient, dbCfg, historyLimit, msg.Payload())
+		handleRequest(context.Background(), replyClient, cfg.DB, cfg.IQRHistoryLimit, msg.Payload())
 	}
 
-	requestClient, err := mqtt.ConnectRequestSubscriber(emqxCfg, handler)
+	requestClient, err := mqtt.ConnectRequestSubscriber(cfg.EMQX, handler)
 	if err != nil {
 		log.Fatalf("failed to connect MQTT: %v", err)
 	}
@@ -188,24 +160,4 @@ func handleRequest(ctx context.Context, client paho.Client, dbCfg db.Config, his
 	}
 	log.Printf("[vacuum-engine] ✓ processed device_id=%s x_status=%s y_status=%s vacuum_status=%v",
 		req.DeviceID, xStatus, yStatus, vacuumStatus)
-}
-
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func requireEnv(key string) string {
-	v := os.Getenv(key)
-	if v == "" {
-		log.Fatalf("%s is not set", key)
-	}
-	return v
-}
-
-func mustParseBool(s string) bool {
-	b, _ := strconv.ParseBool(s)
-	return b
 }
