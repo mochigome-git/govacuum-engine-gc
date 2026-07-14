@@ -56,8 +56,16 @@ func CalcXY(v1, v2, v3 float64) (x, y *float64) {
 	return x, y
 }
 
-// classifyStatus ports update_iqr_status() directly:
+// classifyStatus ports update_iqr_status(), plus one addition on top of
+// the original trigger: when there's no historical data yet (q1/q3 are
+// NaN, boundsKnown is false), we have no basis to call anything "within
+// IQR" — so rather than falling through to a default "Within IQR" (which
+// would let a write happen on zero evidence), this reports "Failed Write"
+// and blocks it, same as any other non-passing classification.
+//
 //   - "Over 1000 Pa/sec" if any leave-time exceeds 1000
+//   - "Failed Write" if IQR bounds aren't known yet (no history for this
+//     device — nothing to compare against)
 //   - "Outlier" if the value falls outside [q1-1.5*IQR, q3+1.5*IQR]
 //     (skipped entirely when the value is nil, matching SQL NULL comparisons
 //     always being unknown/false — falls through to the next check)
@@ -71,7 +79,9 @@ func classifyStatus(value *float64, vacuumStart int, v1, v2, v3, q1, q3 float64)
 	switch {
 	case over1000:
 		return "Over 1000 Pa/sec", false
-	case boundsKnown && value != nil && (*value < q1-1.5*iqr || *value > q3+1.5*iqr):
+	case !boundsKnown:
+		return "Failed Write", false
+	case value != nil && (*value < q1-1.5*iqr || *value > q3+1.5*iqr):
 		return "Outlier", false
 	case vacuumStart > 20:
 		return "Initial Failed", false
@@ -81,11 +91,12 @@ func classifyStatus(value *float64, vacuumStart int, v1, v2, v3, q1, q3 float64)
 }
 
 // ComputeVacuumStatus is the full port of the trigger function body.
-// xStatus/yStatus remain descriptive strings ("Within IQR", "Outlier", ...)
-// — kept for the row that goes to EMQX/the DB, where a human might read
-// them later. xWithin/yWithin are the same classification as plain
-// booleans, for the local reply to gopub-edge that drives PLC write-back
-// (patch.VacuumData.XStatus/YStatus are bool, not string).
+// xStatus/yStatus remain descriptive strings ("Within IQR", "Outlier",
+// "Failed Write", ...) — kept for the row that goes to EMQX/the DB, where
+// a human might read them later. xWithin/yWithin are the same
+// classification as plain booleans, for the local reply to gopub-edge
+// that drives PLC write-back (patch.VacuumData.XStatus/YStatus are bool,
+// not string).
 func ComputeVacuumStatus(vacuumStart int, v1, v2, v3 float64, x, y *float64, historicalX, historicalY []float64) (xStatus, yStatus string, xWithin, yWithin, vacuumStatus bool) {
 	q1x, q3x := iqrBounds(historicalX)
 	q1y, q3y := iqrBounds(historicalY)
