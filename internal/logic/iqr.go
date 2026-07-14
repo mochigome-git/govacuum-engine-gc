@@ -77,13 +77,17 @@ func classifyStatus(value *float64, vacuumStart int, v1, v2, v3, q1, q3 float64)
 }
 
 // ComputeVacuumStatus is the full port of the trigger function body.
-func ComputeVacuumStatus(vacuumStart int, v1, v2, v3 float64, x, y *float64, historicalX, historicalY []float64) (xStatus, yStatus string, vacuumStatus bool) {
+// xStatus/yStatus remain descriptive strings ("Within IQR", "Outlier", ...)
+// — kept for the row that goes to EMQX/the DB, where a human might read
+// them later. xWithin/yWithin are the same classification as plain
+// booleans, for the local reply to gopub-edge that drives PLC write-back
+// (patch.VacuumData.XStatus/YStatus are bool, not string).
+func ComputeVacuumStatus(vacuumStart int, v1, v2, v3 float64, x, y *float64, historicalX, historicalY []float64) (xStatus, yStatus string, xWithin, yWithin, vacuumStatus bool) {
 	q1x, q3x := iqrBounds(historicalX)
 	q1y, q3y := iqrBounds(historicalY)
 
-	var xWithin, yWithin bool
 	xStatus, xWithin = classifyStatus(x, vacuumStart, v1, v2, v3, q1x, q3x)
 	yStatus, yWithin = classifyStatus(y, vacuumStart, v1, v2, v3, q1y, q3y)
 
-	return xStatus, yStatus, xWithin && yWithin
+	return xStatus, yStatus, xWithin, yWithin, xWithin && yWithin
 }

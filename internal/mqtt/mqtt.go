@@ -1,6 +1,18 @@
 // Package mqtt wraps paho for govacuum-engine-gc's two connections:
-// EMQX (subscribe to the shared insert-request topic) and the local edge
-// Mosquitto (publish replies). Exported so package main can call it.
+//
+//   - Local (edge Mosquitto): gopub-edge and vacuum-engine run on the same
+//     Pi, so the upsert REQUEST now arrives here directly instead of
+//     round-tripping through EMQX — ConnectLocal both subscribes to the
+//     request topic AND is reused afterward to publish the reply, one
+//     connection doing both jobs (same pattern gopub-edge itself uses for
+//     its own Mosquitto connection).
+//
+//   - EMQX: used only to publish the finished, fully-computed metric
+//     (original readings + derived x/y + status) to
+//     MQTT_INSERT_REQUEST_TOPIC — the same topic ordinary readings rows
+//     already go through, so the existing general insert engine writes it
+//     with no special-casing. No subscription happens on this client
+//     anymore.
 package mqtt
 
 import (
@@ -14,9 +26,22 @@ import (
 	"github.com/google/uuid"
 )
 
-// EMQXConfig mirrors gopub-edge's publisher-side connection settings —
-// same broker, since this engine consumes what gopub-edge publishes there.
-type EMQXConfig struct {
+// LocalConfig is the local edge Mosquitto broker. RequestTopic must match
+// gopub-edge's LOCAL_VACUUM_REQUEST_TOPIC exactly — that's the topic
+// gopub-edge now publishes vacuum upsert requests to directly.
+type LocalConfig struct {
+	Broker         string
+	Port           string
+	UseTLS         bool
+	CACert         string
+	ClientIDPrefix string
+	RequestTopic   string
+}
+
+// EMQXPublishConfig is EMQX, used only to publish the finished computed
+// metric. RequestTopic here is MQTT_INSERT_REQUEST_TOPIC — same topic
+// gopub-edge's plain "patch" readings already publish to.
+type EMQXPublishConfig struct {
 	Broker         string
 	Port           string
 	Username       string
@@ -24,26 +49,54 @@ type EMQXConfig struct {
 	UseTLS         bool
 	CACert         string
 	ClientIDPrefix string
-	RequestTopic   string // e.g. "gim/devices/payload" — must match gopub-edge's MQTT_INSERT_REQUEST_TOPIC exactly
+	RequestTopic   string
 }
 
-// MosquittoConfig is the local edge Mosquitto broker — where replies
-// actually get published. Typically unauthenticated on a LAN, so
-// Username/Password are intentionally absent; add them if your instance
-// requires auth.
-type MosquittoConfig struct {
-	Broker         string
-	Port           string
-	UseTLS         bool
-	CACert         string
-	ClientIDPrefix string
+// ConnectLocal connects to the local Mosquitto broker and subscribes to
+// cfg.RequestTopic. The returned client is also what you publish replies
+// on (see PublishReply) — no separate connection needed since it's all
+// one local broker.
+func ConnectLocal(cfg LocalConfig, onMessage paho.MessageHandler) (paho.Client, error) {
+	opts := paho.NewClientOptions()
+
+	scheme := "tcp"
+	if cfg.UseTLS {
+		scheme = "ssl"
+	}
+	opts.AddBroker(fmt.Sprintf("%s://%s:%s", scheme, cfg.Broker, cfg.Port))
+
+	prefix := cfg.ClientIDPrefix
+	if prefix == "" {
+		prefix = "vacuum-engine_"
+	}
+	opts.SetClientID(prefix + uuid.New().String())
+	opts.SetAutoReconnect(true)
+
+	if cfg.UseTLS {
+		tlsConfig, err := buildTLSConfig(cfg.CACert)
+		if err != nil {
+			return nil, err
+		}
+		opts.SetTLSConfig(tlsConfig)
+	}
+
+	client := paho.NewClient(opts)
+	if token := client.Connect(); token.Wait() && token.Error() != nil {
+		return nil, fmt.Errorf("Mosquitto connect: %w", token.Error())
+	}
+
+	if token := client.Subscribe(cfg.RequestTopic, 1, onMessage); token.Wait() && token.Error() != nil {
+		client.Disconnect(250)
+		return nil, fmt.Errorf("Mosquitto subscribe to %s: %w", cfg.RequestTopic, token.Error())
+	}
+	log.Printf("[vacuum-engine] ✓ connected to local Mosquitto — listening on %q, replies go out on this same connection", cfg.RequestTopic)
+
+	return client, nil
 }
 
-// ConnectRequestSubscriber connects to EMQX and subscribes to the shared
-// insert-request topic. onMessage fires for every message on that topic,
-// including ones this engine doesn't care about (it's shared with other
-// consumers) — filtering happens in the caller's handler.
-func ConnectRequestSubscriber(cfg EMQXConfig, onMessage paho.MessageHandler) (paho.Client, error) {
+// ConnectEMQXPublisher connects to EMQX for one purpose only: publishing
+// the finished computed metric to cfg.RequestTopic. No subscription.
+func ConnectEMQXPublisher(cfg EMQXPublishConfig) (paho.Client, error) {
 	opts := paho.NewClientOptions()
 
 	// "ssl", not "mqtts" — paho's scheme parser reliably recognizes
@@ -56,7 +109,7 @@ func ConnectRequestSubscriber(cfg EMQXConfig, onMessage paho.MessageHandler) (pa
 
 	prefix := cfg.ClientIDPrefix
 	if prefix == "" {
-		prefix = "vacuum-engine_"
+		prefix = "vacuum-engine-publisher_"
 	}
 	opts.SetClientID(prefix + uuid.New().String())
 	opts.SetUsername(cfg.Username)
@@ -75,49 +128,23 @@ func ConnectRequestSubscriber(cfg EMQXConfig, onMessage paho.MessageHandler) (pa
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
 		return nil, fmt.Errorf("EMQX connect: %w", token.Error())
 	}
-
-	if token := client.Subscribe(cfg.RequestTopic, 1, onMessage); token.Wait() && token.Error() != nil {
-		client.Disconnect(250)
-		return nil, fmt.Errorf("EMQX subscribe to %s: %w", cfg.RequestTopic, token.Error())
-	}
-	log.Printf("[vacuum-engine] ✓ connected to EMQX — listening on %q", cfg.RequestTopic)
+	log.Printf("[vacuum-engine] ✓ connected to EMQX — publishing finished metrics to %q", cfg.RequestTopic)
 
 	return client, nil
 }
 
-// ConnectReplyPublisher connects to the local edge Mosquitto broker —
-// publish-only, no subscription needed here.
-func ConnectReplyPublisher(cfg MosquittoConfig) (paho.Client, error) {
-	opts := paho.NewClientOptions()
-
-	scheme := "tcp"
-	if cfg.UseTLS {
-		scheme = "ssl"
+// PublishMetric marshals payload and publishes it to topic (the EMQX
+// client, MQTT_INSERT_REQUEST_TOPIC) — shaped as a normal readings-style
+// envelope so the general insert engine handles it like any other device
+// payload, no special-casing needed on the receiving end.
+func PublishMetric(client paho.Client, topic string, payload map[string]any) error {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal metric payload: %w", err)
 	}
-	opts.AddBroker(fmt.Sprintf("%s://%s:%s", scheme, cfg.Broker, cfg.Port))
-
-	prefix := cfg.ClientIDPrefix
-	if prefix == "" {
-		prefix = "vacuum-engine-reply_"
-	}
-	opts.SetClientID(prefix + uuid.New().String())
-	opts.SetAutoReconnect(true)
-
-	if cfg.UseTLS {
-		tlsConfig, err := buildTLSConfig(cfg.CACert)
-		if err != nil {
-			return nil, err
-		}
-		opts.SetTLSConfig(tlsConfig)
-	}
-
-	client := paho.NewClient(opts)
-	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		return nil, fmt.Errorf("Mosquitto connect: %w", token.Error())
-	}
-	log.Printf("[vacuum-engine] ✓ connected to local Mosquitto for replies")
-
-	return client, nil
+	token := client.Publish(topic, 1, false, b)
+	token.Wait()
+	return token.Error()
 }
 
 func buildTLSConfig(caCert string) (*tls.Config, error) {
@@ -140,7 +167,8 @@ type replyPayload struct {
 	Data    json.RawMessage `json:"data,omitempty"`
 }
 
-// PublishReply publishes {success, error, data} to replyTopic.
+// PublishReply publishes {success, error, data} to replyTopic, over the
+// same local Mosquitto client ConnectLocal returned.
 func PublishReply(client paho.Client, replyTopic string, success bool, errMsg string, data any) error {
 	var raw json.RawMessage
 	if data != nil {

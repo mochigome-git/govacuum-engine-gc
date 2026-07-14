@@ -17,9 +17,10 @@ import (
 	"govacuum-engine-gc/internal/mqtt"
 )
 
-// incomingRequest is the flat envelope gopub-edge publishes — see its
-// mqttpub package. Only the fields this engine cares about are declared;
-// anything else in the JSON is ignored by json.Unmarshal.
+// incomingRequest is the flat envelope gopub-edge publishes locally — see
+// its mqttpub package (PublishAndAwaitReplyLocal). Only the fields this
+// engine cares about are declared; anything else in the JSON is ignored by
+// json.Unmarshal.
 type incomingRequest struct {
 	TenantID   string          `json:"tenant_id"`
 	DeviceID   string          `json:"device_id"`
@@ -28,10 +29,6 @@ type incomingRequest struct {
 }
 
 // vacuumReadings is what we expect inside "readings" for a vacuum request.
-// vacuum_start/vacuum_leave_* come in as gopub-edge sends them — declared
-// loosely as float64 since PLC values arrive as float64 from the MQTT JSON,
-// matching patch.VacuumData's existing (slightly odd but established)
-// convention of float64 even where the DB column is integer.
 type vacuumReadings struct {
 	VacuumStart     *float64 `json:"vacuum_start"`
 	VacuumLeave1min *float64 `json:"vacuum_leave_1min"`
@@ -39,18 +36,19 @@ type vacuumReadings struct {
 	VacuumLeave3min *float64 `json:"vacuum_leave_3min"`
 }
 
-// vacuumData mirrors gopub-edge's patch.VacuumData exactly — this is what
-// gets marshaled into the reply's "data" field, so SendUpsertRequest's
-// existing parsing (and PLC write-back) works completely unchanged.
-type vacuumData struct {
+// localReplyData mirrors gopub-edge's patch.VacuumData exactly — this is
+// what gets marshaled into the LOCAL reply's "data" field, so
+// SendUpsertRequest's parsing (and PLC write-back) works unchanged.
+// XStatus/YStatus are within-IQR booleans now, matching patch.VacuumData.
+type localReplyData struct {
 	ID              string   `json:"id"`
 	CreatedAt       string   `json:"created_at"`
 	VacuumStart     int      `json:"vacuum_start"`
 	VacuumLeave1min float64  `json:"vacuum_leave_1min"`
 	VacuumLeave2min float64  `json:"vacuum_leave_2min"`
 	VacuumLeave3min float64  `json:"vacuum_leave_3min"`
-	XStatus         string   `json:"x_status"`
-	YStatus         string   `json:"y_status"`
+	XStatus         bool     `json:"x_status"`
+	YStatus         bool     `json:"y_status"`
 	VacuumStatus    bool     `json:"vacuum_status"`
 	X               *float64 `json:"x"`
 	Y               *float64 `json:"y"`
@@ -59,21 +57,28 @@ type vacuumData struct {
 func main() {
 	cfg := config.Load()
 
-	replyClient, err := mqtt.ConnectReplyPublisher(cfg.Mosquitto)
+	// EMQX — publish-only, connect before Local so the handler closure
+	// below can always reach it once a request actually arrives.
+	emqxClient, err := mqtt.ConnectEMQXPublisher(cfg.EMQXPublish)
 	if err != nil {
-		log.Fatalf("failed to connect to Mosquitto: %v", err)
+		log.Fatalf("failed to connect to EMQX: %v", err)
 	}
-	defer replyClient.Disconnect(250)
+	defer emqxClient.Disconnect(250)
 
+	// localClient is assigned below, but the handler closure captures the
+	// variable (not its value at closure-creation time) — safe because
+	// paho won't invoke the handler until Subscribe (inside ConnectLocal)
+	// completes, by which point localClient is already assigned.
+	var localClient paho.Client
 	handler := func(_ paho.Client, msg paho.Message) {
-		handleRequest(context.Background(), replyClient, cfg.DB, cfg.IQRHistoryLimit, msg.Payload())
+		handleRequest(context.Background(), localClient, emqxClient, cfg, msg.Payload())
 	}
 
-	requestClient, err := mqtt.ConnectRequestSubscriber(cfg.EMQX, handler)
+	localClient, err = mqtt.ConnectLocal(cfg.Local, handler)
 	if err != nil {
-		log.Fatalf("failed to connect MQTT: %v", err)
+		log.Fatalf("failed to connect to local Mosquitto: %v", err)
 	}
-	defer requestClient.Disconnect(250)
+	defer localClient.Disconnect(250)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -81,12 +86,14 @@ func main() {
 	log.Println("vacuum-engine shutting down")
 }
 
-// handleRequest parses one incoming message, ignores anything that isn't a
-// vacuum-shaped request (no "vacuum_start" in readings — this topic is
-// shared with other request types), computes IQR status, inserts, and
-// replies. Errors are logged, not fatal — a bad single message shouldn't
-// kill the whole engine.
-func handleRequest(ctx context.Context, client paho.Client, dbCfg db.Config, historyLimit int, raw []byte) {
+// handleRequest parses one incoming local request, ignores anything that
+// isn't a vacuum-shaped request (no "vacuum_start" in readings — this
+// topic could carry other request types too), computes IQR status,
+// publishes the full computed row to EMQX for the general insert engine to
+// write, and replies locally to gopub-edge with the within-IQR booleans
+// for PLC write-back. Errors are logged, not fatal — a bad single message
+// shouldn't kill the whole engine.
+func handleRequest(ctx context.Context, localClient, emqxClient paho.Client, cfg config.Config, raw []byte) {
 	var req incomingRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		log.Printf("[vacuum-engine] ⚠ failed to parse request: %v", err)
@@ -112,7 +119,7 @@ func handleRequest(ctx context.Context, client paho.Client, dbCfg db.Config, his
 	if req.TenantID == "" || req.DeviceID == "" {
 		errMsg := "missing tenant_id or device_id"
 		log.Printf("[vacuum-engine] ⚠ %s", errMsg)
-		_ = mqtt.PublishReply(client, req.ReplyTopic, false, errMsg, nil)
+		_ = mqtt.PublishReply(localClient, req.ReplyTopic, false, errMsg, nil)
 		return
 	}
 
@@ -121,43 +128,64 @@ func handleRequest(ctx context.Context, client paho.Client, dbCfg db.Config, his
 
 	x, y := logic.CalcXY(v1, v2, v3)
 
-	histX, histY, err := db.FetchHistoricalXY(ctx, dbCfg, req.DeviceID, historyLimit)
+	histX, histY, err := db.FetchHistoricalXY(ctx, cfg.DB, req.DeviceID, cfg.IQRHistoryLimit)
 	if err != nil {
 		errMsg := "failed to fetch historical data: " + err.Error()
 		log.Printf("[vacuum-engine] ⚠ %s", errMsg)
-		_ = mqtt.PublishReply(client, req.ReplyTopic, false, errMsg, nil)
+		_ = mqtt.PublishReply(localClient, req.ReplyTopic, false, errMsg, nil)
 		return
 	}
 
-	xStatus, yStatus, vacuumStatus := logic.ComputeVacuumStatus(vacuumStart, v1, v2, v3, x, y, histX, histY)
+	xStatus, yStatus, xWithin, yWithin, vacuumStatus := logic.ComputeVacuumStatus(vacuumStart, v1, v2, v3, x, y, histX, histY)
 
-	id, createdAt, err := db.InsertVacuumMetric(ctx, dbCfg, req.TenantID, req.DeviceID,
-		vacuumStart, v1, v2, v3, x, y, xStatus, yStatus, vacuumStatus)
-	if err != nil {
-		errMsg := "failed to insert metric: " + err.Error()
-		log.Printf("[vacuum-engine] ⚠ %s", errMsg)
-		_ = mqtt.PublishReply(client, req.ReplyTopic, false, errMsg, nil)
-		return
+	// --- Publish the full computed row to EMQX so the general insert ---
+	// --- engine records it — same shape InsertVacuumMetric used to    ---
+	// --- write directly, just over MQTT instead of REST now.         ---
+	metricPayload := map[string]any{
+		"tenant_id":  req.TenantID,
+		"device_id":  req.DeviceID,
+		"resolution": "event",
+		"kind":       "event",
+		"readings": map[string]any{
+			"vacuum_start":      vacuumStart,
+			"vacuum_leave_1min": v1,
+			"vacuum_leave_2min": v2,
+			"vacuum_leave_3min": v3,
+			"x":                 x,
+			"y":                 y,
+		},
+		"status": map[string]any{
+			"x_status":      xStatus,
+			"y_status":      yStatus,
+			"vacuum_status": vacuumStatus,
+		},
+	}
+	if err := mqtt.PublishMetric(emqxClient, cfg.EMQXPublish.RequestTopic, metricPayload); err != nil {
+		// Log and continue — the local reply (below) is what drives PLC
+		// write-back and matters more in the moment; a dropped EMQX
+		// publish means this one reading is missing from history, not a
+		// broken control loop.
+		log.Printf("[vacuum-engine] ⚠ failed to publish metric to EMQX: %v", err)
 	}
 
-	result := vacuumData{
-		ID:              id,
-		CreatedAt:       createdAt.Format(time.RFC3339),
+	// --- Reply locally to gopub-edge for PLC write-back ---
+	result := localReplyData{
 		VacuumStart:     vacuumStart,
 		VacuumLeave1min: v1,
 		VacuumLeave2min: v2,
 		VacuumLeave3min: v3,
-		XStatus:         xStatus,
-		YStatus:         yStatus,
+		XStatus:         xWithin,
+		YStatus:         yWithin,
 		VacuumStatus:    vacuumStatus,
 		X:               x,
 		Y:               y,
+		CreatedAt:       time.Now().UTC().Format(time.RFC3339),
 	}
 
-	if err := mqtt.PublishReply(client, req.ReplyTopic, true, "", result); err != nil {
+	if err := mqtt.PublishReply(localClient, req.ReplyTopic, true, "", result); err != nil {
 		log.Printf("[vacuum-engine] ⚠ failed to publish reply: %v", err)
 		return
 	}
-	log.Printf("[vacuum-engine] ✓ processed device_id=%s x_status=%s y_status=%s vacuum_status=%v",
-		req.DeviceID, xStatus, yStatus, vacuumStatus)
+	log.Printf("[vacuum-engine] ✓ processed device_id=%s x_status=%s(%v) y_status=%s(%v) vacuum_status=%v",
+		req.DeviceID, xStatus, xWithin, yStatus, yWithin, vacuumStatus)
 }

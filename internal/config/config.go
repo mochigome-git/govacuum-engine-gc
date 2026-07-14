@@ -1,7 +1,3 @@
-// Package config centralizes environment loading and configuration parsing
-// for vacuum-engine-gc. It loads .env.local (falling back to .env) once,
-// then exposes a single Config struct built from os.Getenv so main.go
-// doesn't have to know about env var names or parsing details.
 package config
 
 import (
@@ -18,8 +14,8 @@ import (
 // Config holds everything main.go needs to wire up the engine.
 type Config struct {
 	DB              db.Config
-	EMQX            mqtt.EMQXConfig
-	Mosquitto       mqtt.MosquittoConfig
+	Local           mqtt.LocalConfig       // local Mosquitto — receives requests AND publishes replies
+	EMQXPublish     mqtt.EMQXPublishConfig // EMQX — publish-only, finished computed metric
 	IQRHistoryLimit int
 }
 
@@ -38,22 +34,29 @@ func Load() Config {
 			ServiceRoleKey: requireEnv("SUPABASE_SERVICE_ROLE_KEY"),
 			Schema:         getEnv("SUPABASE_SCHEMA", "analytics"),
 		},
-		EMQX: mqtt.EMQXConfig{
+		Local: mqtt.LocalConfig{
+			Broker:         requireEnv("MOSQUITTO_HOST"),
+			Port:           getEnv("MOSQUITTO_PORT", "1883"),
+			UseTLS:         mustParseBool(getEnv("MOSQUITTO_TLS_ON", "false")),
+			CACert:         os.Getenv("MOSQUITTO_CA_CERTIFICATE"),
+			ClientIDPrefix: getEnv("MOSQUITTO_CLIENT_ID_PREFIX", "vacuum-engine_"),
+			// Must match gopub-edge's LOCAL_VACUUM_REQUEST_TOPIC exactly —
+			// same default on both sides so it works out of the box.
+			RequestTopic: getEnv("LOCAL_VACUUM_REQUEST_TOPIC", "gopub-edge/vacuum/request"),
+		},
+		EMQXPublish: mqtt.EMQXPublishConfig{
 			Broker:         requireEnv("EMQX_HOST"),
 			Port:           getEnv("EMQX_PORT", "8883"),
 			Username:       os.Getenv("EMQX_USERNAME"),
 			Password:       os.Getenv("EMQX_PASSWORD"),
 			UseTLS:         mustParseBool(getEnv("EMQX_TLS_ON", "true")),
 			CACert:         os.Getenv("EMQX_CA_CERTIFICATE"),
-			ClientIDPrefix: getEnv("EMQX_CLIENT_ID_PREFIX", "vacuum-engine_"),
-			RequestTopic:   requireEnv("MQTT_INSERT_REQUEST_TOPIC"), // must match gopub-edge's setting exactly
-		},
-		Mosquitto: mqtt.MosquittoConfig{
-			Broker:         requireEnv("MOSQUITTO_HOST"),
-			Port:           getEnv("MOSQUITTO_PORT", "1883"),
-			UseTLS:         mustParseBool(getEnv("MOSQUITTO_TLS_ON", "false")),
-			CACert:         os.Getenv("MOSQUITTO_CA_CERTIFICATE"),
-			ClientIDPrefix: getEnv("MOSQUITTO_CLIENT_ID_PREFIX", "vacuum-engine-reply_"),
+			ClientIDPrefix: getEnv("EMQX_CLIENT_ID_PREFIX", "vacuum-engine-publisher_"),
+			// Must match gopub-edge's MQTT_INSERT_REQUEST_TOPIC exactly —
+			// the finished row goes out on the same topic ordinary
+			// readings already use, so the general insert engine handles
+			// it with no special-casing.
+			RequestTopic: requireEnv("EMQX_INSERT_REQUEST_TOPIC"),
 		},
 		IQRHistoryLimit: historyLimit,
 	}

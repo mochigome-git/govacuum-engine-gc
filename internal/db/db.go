@@ -1,9 +1,15 @@
-// Package db handles all data access for govacuum-engine-gc via
-// Supabase's PostgREST REST API — no direct Postgres connection, no
-// connection pool, no pooler-mode gotchas. Needs the service_role key
-// (not anon) since it must bypass RLS for both the historical read and
-// the insert, and the "analytics" schema must be added to Supabase's
-// exposed-schemas list (Project Settings → API) or every request 404s.
+// Package db handles data access for govacuum-engine-gc via Supabase's
+// PostgREST REST API — no direct Postgres connection, no connection pool,
+// no pooler-mode gotchas. Needs the service_role key (not anon) since it
+// must bypass RLS to read historical data, and the "analytics" schema must
+// be added to Supabase's exposed-schemas list (Project Settings → API) or
+// every request 404s.
+//
+// Note: this package no longer writes to the DB. vacuum-engine only reads
+// history here (FetchHistoricalXY) — the computed row itself is published
+// to EMQX (see internal/mqtt.PublishMetric) and written by the existing
+// general insert engine, the same path every other readings row already
+// goes through.
 package db
 
 import (
@@ -115,56 +121,4 @@ func FetchHistoricalXY(ctx context.Context, cfg Config, deviceID string, limit i
 	sort.Float64s(ys)
 
 	return xs, ys, nil
-}
-
-// InsertVacuumMetric writes the computed row into analytics.metrics via
-// PostgREST. readings holds the raw + derived values; status holds the
-// classification. Returns the generated id (as a string — the underlying
-// column is bigint, converted here so it stays compatible with gopub-edge's
-// patch.VacuumData.ID, which is typed string) and created_at.
-func InsertVacuumMetric(ctx context.Context, cfg Config, tenantID, deviceID string,
-	vacuumStart int, v1, v2, v3 float64, x, y *float64, xStatus, yStatus string, vacuumStatus bool) (id string, createdAt time.Time, err error) {
-
-	payload := map[string]any{
-		"tenant_id":  tenantID,
-		"device_id":  deviceID,
-		"resolution": "event",
-		"kind":       "event",
-		"readings": map[string]any{
-			"vacuum_start":      vacuumStart,
-			"vacuum_leave_1min": v1,
-			"vacuum_leave_2min": v2,
-			"vacuum_leave_3min": v3,
-			"x":                 x,
-			"y":                 y,
-		},
-		"status": map[string]any{
-			"x_status":      xStatus,
-			"y_status":      yStatus,
-			"vacuum_status": vacuumStatus,
-		},
-	}
-
-	reqBody, err := json.Marshal(payload)
-	if err != nil {
-		return "", time.Time{}, fmt.Errorf("marshal insert payload: %w", err)
-	}
-
-	respBody, err := cfg.doRequest(ctx, http.MethodPost, "metrics", nil, "Content-Profile", reqBody)
-	if err != nil {
-		return "", time.Time{}, fmt.Errorf("insert metric: %w", err)
-	}
-
-	var inserted []struct {
-		ID        json.Number `json:"id"`
-		CreatedAt time.Time   `json:"created_at"`
-	}
-	if err := json.Unmarshal(respBody, &inserted); err != nil {
-		return "", time.Time{}, fmt.Errorf("parse insert response: %w", err)
-	}
-	if len(inserted) == 0 {
-		return "", time.Time{}, fmt.Errorf("insert returned no rows")
-	}
-
-	return inserted[0].ID.String(), inserted[0].CreatedAt, nil
 }
