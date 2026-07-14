@@ -28,7 +28,7 @@ type Config struct {
 // environment. It calls log.Fatalf for any required variable that's missing,
 // matching main.go's previous behavior.
 func Load() Config {
-	_ = godotenv.Load(".env.local", ".env")
+	loadDotEnv()
 
 	historyLimit, _ := strconv.Atoi(getEnv("IQR_HISTORY_LIMIT", "1000"))
 
@@ -56,6 +56,27 @@ func Load() Config {
 			ClientIDPrefix: getEnv("MOSQUITTO_CLIENT_ID_PREFIX", "vacuum-engine-reply_"),
 		},
 		IQRHistoryLimit: historyLimit,
+	}
+}
+
+// loadDotEnv tries .env.local first, and only falls back to .env if
+// .env.local itself doesn't exist. godotenv.Load(".env.local", ".env")
+// looks like a fallback but isn't — it loads both files in order and
+// bails out on the first missing one, so if .env.local is absent it
+// never even tries .env. This does the fallback the caller actually wants.
+// Both files are optional — real env vars set in the shell always win over
+// either.
+func loadDotEnv() {
+	if _, err := os.Stat(".env.local"); err == nil {
+		if err := godotenv.Load(".env.local"); err != nil {
+			log.Printf("[config] found .env.local but failed to load it: %v", err)
+		}
+		return
+	}
+	if _, err := os.Stat(".env"); err == nil {
+		if err := godotenv.Load(".env"); err != nil {
+			log.Printf("[config] found .env but failed to load it: %v", err)
+		}
 	}
 }
 
