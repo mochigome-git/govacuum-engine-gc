@@ -4,6 +4,16 @@ package logic
 
 import "math"
 
+// minIQRSamples is the minimum number of historical points needed before
+// an IQR bound means anything. With very few points (2-3), Q1/Q3 land
+// almost on top of each other, so the IQR band is razor-thin and any
+// reading that isn't nearly identical to the first couple gets flagged
+// "Outlier" — a false positive caused by lack of data, not an actual
+// anomaly. Below this count we report "No Data"/"Building Data" instead
+// and let the write through, rather than judging against a statistically
+// meaningless band.
+const minIQRSamples = 10
+
 // percentileContinuous replicates PostgreSQL's percentile_cont(p) WITHIN
 // GROUP (ORDER BY ...) — linear interpolation between order statistics.
 // sorted must already be sorted ascending. Returns NaN for an empty slice,
@@ -56,35 +66,39 @@ func CalcXY(v1, v2, v3 float64) (x, y *float64) {
 	return x, y
 }
 
-// classifyStatus ports update_iqr_status(), plus one addition on top of
-// the original trigger: when there's no historical data yet (q1/q3 are
-// NaN, boundsKnown is false), we have no basis to call anything "within
-// IQR" — so rather than falling through to a default "Within IQR" (which
-// would let a write happen on zero evidence), this reports "Failed Write"
-// and blocks it, same as any other non-passing classification.
+// classifyStatus ports update_iqr_status(), with two additions on top of
+// the original trigger to handle a device that doesn't have enough
+// history yet:
 //
-//   - "Over 1000 Pa/sec" if any leave-time exceeds 1000
-//   - "Failed Write" if IQR bounds aren't known yet (no history for this
-//     device — nothing to compare against)
-//   - "Outlier" if the value falls outside [q1-1.5*IQR, q3+1.5*IQR]
-//     (skipped entirely when the value is nil, matching SQL NULL comparisons
-//     always being unknown/false — falls through to the next check)
-//   - "Initial Failed" if vacuumStart > 20
+//   - "Over 1000 Pa/sec" if any leave-time exceeds 1000 (hard fault,
+//     checked first, independent of history)
+//   - "Initial Failed" if vacuumStart > 20 (also a hard fault, independent
+//     of history — checked before the data-volume checks below so a real
+//     fault still blocks the write even while history is thin)
+//   - "No Data" if there's no history at all for this device yet
+//     (sampleCount == 0) — within=true, write proceeds
+//   - "Building Data" if there's some history but not enough to trust the
+//     IQR bounds yet (sampleCount < minIQRSamples) — within=true, write
+//     proceeds. With only 2-3 points, Q1/Q3 sit almost on top of each
+//     other, so the "outlier" band is too thin to mean anything.
+//   - "Outlier" if the value falls outside [q1-1.5*IQR, q3+1.5*IQR], once
+//     there's enough history to compute that meaningfully
 //   - "Within IQR" otherwise
-func classifyStatus(value *float64, vacuumStart int, v1, v2, v3, q1, q3 float64) (status string, within bool) {
+func classifyStatus(value *float64, vacuumStart int, v1, v2, v3, q1, q3 float64, sampleCount int) (status string, within bool) {
 	over1000 := v1 > 1000 || v2 > 1000 || v3 > 1000
 	iqr := q3 - q1
-	boundsKnown := !math.IsNaN(q1) && !math.IsNaN(q3)
 
 	switch {
 	case over1000:
 		return "Over 1000 Pa/sec", false
-	case !boundsKnown:
-		return "Failed Write", false
-	case value != nil && (*value < q1-1.5*iqr || *value > q3+1.5*iqr):
-		return "Outlier", false
 	case vacuumStart > 20:
 		return "Initial Failed", false
+	case sampleCount == 0:
+		return "No Data", true
+	case sampleCount < minIQRSamples:
+		return "Building Data", true
+	case value != nil && (*value < q1-1.5*iqr || *value > q3+1.5*iqr):
+		return "Outlier", false
 	default:
 		return "Within IQR", true
 	}
@@ -92,17 +106,20 @@ func classifyStatus(value *float64, vacuumStart int, v1, v2, v3, q1, q3 float64)
 
 // ComputeVacuumStatus is the full port of the trigger function body.
 // xStatus/yStatus remain descriptive strings ("Within IQR", "Outlier",
-// "Failed Write", ...) — kept for the row that goes to EMQX/the DB, where
-// a human might read them later. xWithin/yWithin are the same
-// classification as plain booleans, for the local reply to gopub-edge
-// that drives PLC write-back (patch.VacuumData.XStatus/YStatus are bool,
-// not string).
+// "No Data", "Building Data", ...) — kept for the row that goes to
+// EMQX/the DB, where a human might read them later. xWithin/yWithin are
+// the same classification as plain booleans, for the local reply to
+// gopub-edge that drives PLC write-back (patch.VacuumData.XStatus/YStatus
+// are bool, not string). historicalX/historicalY always have matching
+// lengths (db.FetchHistoricalXY only appends a pair when both x and y are
+// present on a row), so either length works as the shared sample count.
 func ComputeVacuumStatus(vacuumStart int, v1, v2, v3 float64, x, y *float64, historicalX, historicalY []float64) (xStatus, yStatus string, xWithin, yWithin, vacuumStatus bool) {
 	q1x, q3x := iqrBounds(historicalX)
 	q1y, q3y := iqrBounds(historicalY)
+	sampleCount := len(historicalX)
 
-	xStatus, xWithin = classifyStatus(x, vacuumStart, v1, v2, v3, q1x, q3x)
-	yStatus, yWithin = classifyStatus(y, vacuumStart, v1, v2, v3, q1y, q3y)
+	xStatus, xWithin = classifyStatus(x, vacuumStart, v1, v2, v3, q1x, q3x, sampleCount)
+	yStatus, yWithin = classifyStatus(y, vacuumStart, v1, v2, v3, q1y, q3y, sampleCount)
 
 	return xStatus, yStatus, xWithin, yWithin, xWithin && yWithin
 }
