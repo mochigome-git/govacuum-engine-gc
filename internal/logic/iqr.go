@@ -6,11 +6,14 @@ import "math"
 
 // percentileContinuous replicates PostgreSQL's percentile_cont(p) WITHIN
 // GROUP (ORDER BY ...) — linear interpolation between order statistics.
-// sorted must already be sorted ascending.
+// sorted must already be sorted ascending. Returns NaN for an empty slice,
+// matching Postgres returning NULL for percentile_cont() over zero rows —
+// callers must treat NaN as "no bound", not zero, or every outlier check
+// silently becomes "greater than 0" for any device with no history yet.
 func percentileContinuous(sorted []float64, p float64) float64 {
 	n := len(sorted)
 	if n == 0 {
-		return 0
+		return math.NaN()
 	}
 	if n == 1 {
 		return sorted[0]
@@ -63,11 +66,12 @@ func CalcXY(v1, v2, v3 float64) (x, y *float64) {
 func classifyStatus(value *float64, vacuumStart int, v1, v2, v3, q1, q3 float64) (status string, within bool) {
 	over1000 := v1 > 1000 || v2 > 1000 || v3 > 1000
 	iqr := q3 - q1
+	boundsKnown := !math.IsNaN(q1) && !math.IsNaN(q3)
 
 	switch {
 	case over1000:
 		return "Over 1000 Pa/sec", false
-	case value != nil && (*value < q1-1.5*iqr || *value > q3+1.5*iqr):
+	case boundsKnown && value != nil && (*value < q1-1.5*iqr || *value > q3+1.5*iqr):
 		return "Outlier", false
 	case vacuumStart > 20:
 		return "Initial Failed", false
