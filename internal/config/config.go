@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/joho/godotenv"
 
@@ -15,8 +16,19 @@ import (
 type Config struct {
 	DB              db.Config
 	Local           mqtt.LocalConfig       // local Mosquitto — receives requests AND publishes replies
-	EMQXPublish     mqtt.EMQXPublishConfig // EMQX — publish-only, finished computed metric
+	EMQXPublish     mqtt.EMQXPublishConfig // EMQX — publish-only, finished computed metric + heartbeat
 	IQRHistoryLimit int
+
+	// Heartbeat — periodic liveness ping over the same EMQX publish path,
+	// landing in the same table as computed metrics with
+	// status.kind="heartbeat". TenantID/DeviceID identify this
+	// vacuum-engine instance itself (same edge unit as gopub-edge, so
+	// reuse the same TENANT_ID/DEVICE_ID env vars rather than inventing
+	// separate ones).
+	TenantID          string
+	DeviceID          string
+	HeartbeatInterval time.Duration
+	AppVersion        string
 }
 
 // Load reads .env.local (falling back to .env) if present — best-effort,
@@ -27,6 +39,7 @@ func Load() Config {
 	loadDotEnv()
 
 	historyLimit, _ := strconv.Atoi(getEnv("IQR_HISTORY_LIMIT", "1000"))
+	heartbeatIntervalSec, _ := strconv.Atoi(getEnv("HEARTBEAT_INTERVAL_SEC", "30"))
 
 	return Config{
 		DB: db.Config{
@@ -56,9 +69,14 @@ func Load() Config {
 			// the finished row goes out on the same topic ordinary
 			// readings already use, so the general insert engine handles
 			// it with no special-casing.
-			RequestTopic: requireEnv("EMQX_INSERT_REQUEST_TOPIC"),
+			RequestTopic: requireEnv("MQTT_INSERT_REQUEST_TOPIC"),
 		},
 		IQRHistoryLimit: historyLimit,
+
+		TenantID:          os.Getenv("TENANT_ID"),
+		DeviceID:          os.Getenv("DEVICE_ID"),
+		HeartbeatInterval: time.Duration(heartbeatIntervalSec) * time.Second,
+		AppVersion:        getEnv("APP_VERSION", "dev"),
 	}
 }
 

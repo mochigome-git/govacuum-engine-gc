@@ -39,7 +39,10 @@ type vacuumReadings struct {
 // localReplyData mirrors gopub-edge's patch.VacuumData exactly — this is
 // what gets marshaled into the LOCAL reply's "data" field, so
 // SendUpsertRequest's parsing (and PLC write-back) works unchanged.
-// XStatus/YStatus are within-IQR booleans now, matching patch.VacuumData.
+// XStatus/YStatus are the descriptive classification strings ("Within
+// IQR", "Outlier", "Building Data", "No Data", ...) — gopub-edge writes
+// these to W10/W20, which are word/text registers expecting a status
+// label, not boolean coils. Only VacuumStatus is a real bool (M4350).
 type localReplyData struct {
 	ID              string   `json:"id"`
 	CreatedAt       string   `json:"created_at"`
@@ -47,14 +50,15 @@ type localReplyData struct {
 	VacuumLeave1min float64  `json:"vacuum_leave_1min"`
 	VacuumLeave2min float64  `json:"vacuum_leave_2min"`
 	VacuumLeave3min float64  `json:"vacuum_leave_3min"`
-	XStatus         bool     `json:"x_status"`
-	YStatus         bool     `json:"y_status"`
+	XStatus         string   `json:"x_status"`
+	YStatus         string   `json:"y_status"`
 	VacuumStatus    bool     `json:"vacuum_status"`
 	X               *float64 `json:"x"`
 	Y               *float64 `json:"y"`
 }
 
 func main() {
+	startTime := time.Now()
 	cfg := config.Load()
 
 	// EMQX — publish-only, connect before Local so the handler closure
@@ -64,6 +68,9 @@ func main() {
 		log.Fatalf("failed to connect to EMQX: %v", err)
 	}
 	defer emqxClient.Disconnect(250)
+
+	stopHeartbeat := make(chan struct{})
+	mqtt.StartHeartbeat(emqxClient, stopHeartbeat, cfg.EMQXPublish.RequestTopic, cfg.TenantID, cfg.DeviceID, cfg.AppVersion, startTime, cfg.HeartbeatInterval)
 
 	// localClient is assigned below, but the handler closure captures the
 	// variable (not its value at closure-creation time) — safe because
@@ -83,6 +90,7 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
+	close(stopHeartbeat)
 	log.Println("vacuum-engine shutting down")
 }
 
@@ -174,8 +182,8 @@ func handleRequest(ctx context.Context, localClient, emqxClient paho.Client, cfg
 		VacuumLeave1min: v1,
 		VacuumLeave2min: v2,
 		VacuumLeave3min: v3,
-		XStatus:         xWithin,
-		YStatus:         yWithin,
+		XStatus:         xStatus,
+		YStatus:         yStatus,
 		VacuumStatus:    vacuumStatus,
 		X:               x,
 		Y:               y,
