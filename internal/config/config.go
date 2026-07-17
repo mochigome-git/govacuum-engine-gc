@@ -69,7 +69,7 @@ func Load() Config {
 			// the finished row goes out on the same topic ordinary
 			// readings already use, so the general insert engine handles
 			// it with no special-casing.
-			RequestTopic: requireEnv("MQTT_INSERT_REQUEST_TOPIC"),
+			RequestTopic: requireEnv("EMQX_INSERT_REQUEST_TOPIC"),
 		},
 		IQRHistoryLimit: historyLimit,
 
