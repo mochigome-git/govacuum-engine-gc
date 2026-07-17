@@ -43,7 +43,7 @@ func StartHeartbeat(client paho.Client, stop <-chan struct{}, topic, tenantID, d
 				if err := PublishMetric(client, topic, hb); err != nil {
 					log.Printf("[vacuum-engine] ⚠ heartbeat publish failed: %v", err)
 				} else {
-					log.Printf("[vacuum-engine] ♥ heartbeat published (topic=%s uptime_s=%v)", topic, hb["status"].(map[string]any)["uptime_s"])
+					//log.Printf("[vacuum-engine] ♥ heartbeat published (topic=%s uptime_s=%v)", topic, hb["status"].(map[string]any)["uptime_s"])
 				}
 			}
 		}
