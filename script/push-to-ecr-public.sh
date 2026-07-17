@@ -22,10 +22,10 @@ set +a
 ECR_PUBLIC_REGION="us-east-1"
 AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
-PRIVATE_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${ECR_REGION}.amazonaws.com/${ECR_REPO_NAME}:${APP_VERSION}"
-PUBLIC_IMAGE="public.ecr.aws/${ECR_PUBLIC_ALIAS}/${ECR_PUBLIC_REPO_NAME}:${APP_VERSION}"
+PRIVATE_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${ECR_REGION}.amazonaws.com/${ECR_REPO_NAME}:v${APP_VERSION}"
+PUBLIC_IMAGE="public.ecr.aws/${ECR_PUBLIC_ALIAS}/${ECR_PUBLIC_REPO_NAME}:v${APP_VERSION}"
 PUBLIC_IMAGE_LATEST="public.ecr.aws/${ECR_PUBLIC_ALIAS}/${ECR_PUBLIC_REPO_NAME}:latest"
-LOCAL_IMAGE="${DOCKER_TAG}:${APP_VERSION}"
+LOCAL_IMAGE="${DOCKER_TAG}:v${APP_VERSION}"
 
 echo ""
 echo "  Private : ${PRIVATE_IMAGE}"
@@ -59,4 +59,4 @@ docker push "${PUBLIC_IMAGE}"
 docker push "${PUBLIC_IMAGE_LATEST}"
 
 echo ""
-echo "✅ Done! public.ecr.aws/${ECR_PUBLIC_ALIAS}/${ECR_PUBLIC_REPO_NAME}:${APP_VERSION}"
+echo "✅ Done! public.ecr.aws/${ECR_PUBLIC_ALIAS}/${ECR_PUBLIC_REPO_NAME}:v${APP_VERSION}"
